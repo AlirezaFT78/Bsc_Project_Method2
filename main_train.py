@@ -148,7 +148,7 @@ def main():
 
         
     
-    print(model1.encoder_decoder.sec_memory_matrix.requires_grad)# get function handles of loss and metrics
+    # get function handles of loss and metrics
     criterion = compute_loss
     metrics = compute_scores
 
