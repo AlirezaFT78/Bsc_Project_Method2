@@ -2,6 +2,7 @@ import argparse
 
 import numpy as np
 import torch
+import random
 
 from models.models import BaseCMNModel
 from modules.dataloaders import R2DataLoader
@@ -102,6 +103,8 @@ def main():
     args = parse_agrs()
 
     # fix random seeds
+    args.seed = random.randint(0,10000)
+    print('seed:', args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -116,18 +119,45 @@ def main():
     test_dataloader = R2DataLoader(args, tokenizer, split='test', shuffle=False)
 
     # build model architecture
-    model = BaseCMNModel(args, tokenizer)
+    
+    model0 = torch.load('/content/data/model_iu_xray.pth')
+    model1 = BaseCMNModel(args, tokenizer)
 
-    # get function handles of loss and metrics
+    dict0 = model0['state_dict']
+    dict1 = model1.state_dict()
+    
+    for p0 in dict0:
+      dict1[p0]=dict0[p0]
+
+    dict1['encoder_decoder.sec_memory_matrix'] = dict0['encoder_decoder.memory_matrix']
+    model1.load_state_dict(dict1)
+    
+    c=0
+    for p in model1.named_parameters():
+      c+=1
+      if p[0]=='encoder_decoder.sec_decoder.encoder.norm.b_2':
+        break
+
+    i = 0
+    for p in model1.named_parameters():
+      if i< c:
+        p[1].requires_grad = False
+        i+=1  
+      if p[0] == 'encoder_decoder.sec_memory_matrix':
+        p[1].requires_grad = True
+
+        
+    
+    print(model1.encoder_decoder.sec_memory_matrix.requires_grad)# get function handles of loss and metrics
     criterion = compute_loss
     metrics = compute_scores
 
     # build optimizer, learning rate scheduler
-    optimizer = build_optimizer(args, model)
+    optimizer = build_optimizer(args, model1)
     lr_scheduler = build_lr_scheduler(args, optimizer)
 
     # build trainer and start to train
-    trainer = Trainer(model, criterion, metrics, optimizer, args, lr_scheduler, train_dataloader, val_dataloader, test_dataloader)
+    trainer = Trainer(model1, criterion, metrics, optimizer, args, lr_scheduler, train_dataloader, val_dataloader, test_dataloader)
     trainer.train()
 
 
