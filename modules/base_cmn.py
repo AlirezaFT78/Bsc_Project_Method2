@@ -22,6 +22,15 @@ def subsequent_mask(size):
     subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
     return torch.from_numpy(subsequent_mask) == 0
 
+def embed_mask(seq):
+    seq_mask = (seq.data > 0)
+    seq_mask[:, 0] += True
+    seq_mask = seq_mask.unsqueeze(-2)
+    seq_mask = seq_mask.expand(seq_mask.shape[0],seq_mask.shape[-1],seq_mask.shape[-1])
+    return seq_mask
+    
+     
+
 
 def attention(query, key, value, mask=None, dropout=None):
     d_k = query.size(-1)
@@ -73,7 +82,7 @@ class Transformer(nn.Module):
         embeddings = embeddings + responses
         # Memory querying and responding for textual features
 
-        return self.decoder(embeddings, memory, src_mask, tgt_mask, past=past)
+        return self.decoder(embeddings, memory, src_mask, tgt_mask, past=past), memory, src_mask
 
 
 class Encoder(nn.Module):
@@ -317,6 +326,28 @@ class BaseCMN(AttModel):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
         return model
+    
+    def make_sec_decoder(self, tgt_vocab, cmn):
+        c = copy.deepcopy
+        attn = MultiHeadedAttention(self.num_heads, self.d_model)
+        ff = PositionwiseFeedForward(self.d_model, self.d_ff, self.dropout)
+        position = PositionalEncoding(self.d_model, self.dropout)
+        model = Transformer(
+            Encoder(EncoderLayer(self.d_model, c(attn), c(ff), self.dropout),0),
+            Decoder(DecoderLayer(self.d_model, c(attn), c(attn), c(ff), self.dropout), self.num_layers),
+            nn.Sequential(c(position)),
+            nn.Sequential(Embeddings(self.d_model, tgt_vocab), c(position)), cmn)
+        for p in model.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+        model = model.to('cuda')
+        return model
+
+    def make_sec_tgt_embd(self,tgt_vocab):
+        c = copy.deepcopy
+        position = PositionalEncoding(self.d_model, self.dropout)
+        return nn.Sequential(Embeddings(self.d_model, tgt_vocab), c(position))
+
 
     def __init__(self, args, tokenizer):
         super(BaseCMN, self).__init__(args, tokenizer)
@@ -329,14 +360,16 @@ class BaseCMN(AttModel):
         self.topk = args.topk
 
         tgt_vocab = self.vocab_size + 1
-
         self.cmn = MultiThreadMemory(args.num_heads, args.d_model, topk=args.topk)
-
         self.model = self.make_model(tgt_vocab, self.cmn)
         self.logit = nn.Linear(args.d_model, tgt_vocab)
-
         self.memory_matrix = nn.Parameter(torch.FloatTensor(args.cmm_size, args.cmm_dim))
         nn.init.normal_(self.memory_matrix, 0, 1 / args.cmm_dim)
+        
+        self.sec_decoder = self.make_sec_decoder(tgt_vocab, self.cmn)
+        self.sec_logit = nn.Linear(args.d_model, tgt_vocab)
+        self.sec_memory_matrix = nn.Parameter(torch.FloatTensor(args.cmm_size, args.cmm_dim))
+      
 
     def init_hidden(self, bsz):
         return []
@@ -375,8 +408,11 @@ class BaseCMN(AttModel):
 
     def _forward(self, fc_feats, att_feats, seq, att_masks=None):
         att_feats, seq, att_masks, seq_mask = self._prepare_feature_forward(att_feats, att_masks, seq)
-        out = self.model(att_feats, seq, att_masks, seq_mask, memory_matrix=self.memory_matrix)
-        outputs = F.log_softmax(self.logit(out), dim=-1)
+        embd, memory, src_mask = self.model(att_feats, seq, att_masks, seq_mask, memory_matrix=self.memory_matrix)
+        outputs = F.log_softmax(self.logit(embd), dim=-1)
+        new_tgt = torch.argmax(outputs,dim=-1)
+        out = self.sec_decoder.decode(memory, src_mask, new_tgt, embed_mask(seq), memory_matrix=self.sec_memory_matrix)[0]
+        outputs = F.log_softmax(self.sec_logit(out), dim=-1)
 
         return outputs
 
@@ -393,9 +429,9 @@ class BaseCMN(AttModel):
         else:
             ys = torch.cat([state[0][0], it.unsqueeze(1)], dim=1)
             past = state[1:]
-        out, past = self.model.decode(memory, mask, ys, subsequent_mask(ys.size(1)).to(memory.device), past=past,
+        (out, past), memory, src_mask = self.model.decode(memory, mask, ys, subsequent_mask(ys.size(1)).to(memory.device), past=past,
                                       memory_matrix=self.memory_matrix)
-
+        
         if not self.training:
             self._save_attns(start=len(state) == 0)
-        return out[:, -1], [ys.unsqueeze(0)] + past
+        return out[:, -1], [ys.unsqueeze(0)] + past , memory, src_mask
